@@ -694,20 +694,24 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupUCX::recvAnysource(
 
 void ProcessGroupUCX::reduce_locked(std::vector<at::Tensor>& tensors,
                                     c10d::ReduceOp op, int root) {
+  TORCH_CHECK(root >= 0 && root < size_, "commux reduce: root out of range");
   int vrank = (rank_ - root + size_) % size_;
   for (size_t i = 0; i < tensors.size(); ++i) {
     at::Tensor& t = tensors[i];
     TORCH_CHECK(t.is_contiguous(), "commux reduce: tensor must be contiguous");
-    at::Tensor tmp;
+    at::Tensor acc = t, tmp;
     for (int mask = 1; mask < size_; mask <<= 1) {
       if (vrank & mask) {
-        coll_send(t, (vrank - mask + root) % size_, static_cast<uint32_t>(i));
+        coll_send(acc, (vrank - mask + root) % size_, static_cast<uint32_t>(i));
         break;
       }
       if (vrank + mask < size_) {
-        if (!tmp.defined()) tmp = at::empty_like(t);
+        if (!tmp.defined()) {
+          tmp = at::empty_like(t);
+          if (vrank != 0) acc = t.clone();
+        }
         coll_recv(tmp, (vrank + mask + root) % size_, static_cast<uint32_t>(i));
-        apply_reduce(t, tmp, op);
+        apply_reduce(acc, tmp, op);
       }
     }
   }
@@ -715,6 +719,7 @@ void ProcessGroupUCX::reduce_locked(std::vector<at::Tensor>& tensors,
 
 void ProcessGroupUCX::broadcast_locked(std::vector<at::Tensor>& tensors,
                                        int root) {
+  TORCH_CHECK(root >= 0 && root < size_, "commux broadcast: root out of range");
   int vrank = (rank_ - root + size_) % size_;
   for (size_t i = 0; i < tensors.size(); ++i) {
     at::Tensor& t = tensors[i];
