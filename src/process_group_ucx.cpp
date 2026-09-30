@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include <poll.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -59,9 +60,58 @@ int wait_poll_ms() {
 // an event arrives, so latency is unchanged in the common case; the timeout
 // only caps idle sleep, keeping CPU near zero rather than busy-spinning
 // ucp_worker_progress().
-void worker_wait_timed(ucp_worker_h worker) {
+int spin_us() {
+  static const int us = [] {
+    const char* e = std::getenv("COMMUX_SPIN_US");
+    int v = e ? std::atoi(e) : 0;
+    return v > 0 ? v : 0;
+  }();
+  return us;
+}
+
+// One budget per wait(). Re-entries after an unrelated completion keep `end`,
+// so the total spin is COMMUX_SPIN_US however many completions arrive.
+struct SpinBudget {
+  bool on = false;
+  std::chrono::steady_clock::time_point end{};
+  const std::chrono::steady_clock::time_point* deadline() const {
+    return on ? &end : nullptr;
+  }
+  bool expired() const {
+    return on && !(std::chrono::steady_clock::now() < end);
+  }
+  static SpinBudget start() {
+    SpinBudget b;
+    int us = spin_us();
+    if (us > 0) {
+      b.on = true;
+      b.end = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+    }
+    return b;
+  }
+};
+
+// `deadline` is the end of this wait's whole spin budget. Unrelated
+// completions return early so the caller can reap, and the same deadline is
+// passed back in. A null deadline (COMMUX_SPIN_US unset or 0) does not spin.
+// Once `deadline` is already past, a UCS_ERR_BUSY return must not fall back
+// into a tight progress loop: arm refuses to sleep while events are queued,
+// which is exactly a stream of unrelated completions.
+void worker_wait_timed(ucp_worker_h worker,
+                       const std::chrono::steady_clock::time_point* deadline) {
+  if (deadline != nullptr) {
+    while (std::chrono::steady_clock::now() < *deadline) {
+      if (ucp_worker_progress(worker)) return;
+    }
+  }
   ucs_status_t s = ucp_worker_arm(worker);
-  if (s == UCS_ERR_BUSY) return;  // events arrived during arm -> progress now
+  if (s == UCS_ERR_BUSY) {
+    if (deadline != nullptr &&
+        !(std::chrono::steady_clock::now() < *deadline)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(wait_poll_ms()));
+    }
+    return;  // events arrived during arm -> progress now
+  }
   if (s != UCS_OK) {
     std::this_thread::yield();  // wakeup unsupported: fall back to a yield
     return;
@@ -274,12 +324,18 @@ class UCXWork : public c10d::Work {
     // worker -- their progress is precisely what completes this Work. (Holding
     // the mutex across a blocking ucp_worker_wait() would serialize, and can
     // deadlock, multi-threaded consumers such as snapy.)
+    SpinBudget spin = SpinBudget::start();
     while (!reap()) {
-      if (ucp_worker_progress(worker_)) continue;  // advanced; re-check
+      if (ucp_worker_progress(worker_)) {
+        // Advanced. A stream of unrelated completions stays on this branch and
+        // would never consult the one per-wait deadline below.
+        if (spin.expired()) worker_wait_timed(worker_, spin.deadline());
+        continue;
+      }
       // Idle: sleep on the worker's wakeup fd, but only until the next event or
       // a short timeout -- a bounded sleep so concurrently parked threads can't
       // miss a lost wakeup on the shared worker (see worker_wait_timed).
-      worker_wait_timed(worker_);
+      worker_wait_timed(worker_, spin.deadline());
     }
     if (err_) {
       std::rethrow_exception(err_);
@@ -501,9 +557,14 @@ void ProcessGroupUCX::wait_request(void* req) {
   // wakeup fd (bounded, to avoid the lost-wakeup deadlock -- see
   // worker_wait_timed) instead of busy-spinning. Caller holds worker_mu_.
   ucs_status_t st;
+  SpinBudget spin = SpinBudget::start();
   while ((st = ucp_request_check_status(req)) == UCS_INPROGRESS) {
-    if (ucp_worker_progress(worker_)) continue;
-    worker_wait_timed(worker_);
+    if (ucp_worker_progress(worker_)) {
+      // Same budget as UCXWork::wait. Unrelated completions must not skip it.
+      if (spin.expired()) worker_wait_timed(worker_, spin.deadline());
+      continue;
+    }
+    worker_wait_timed(worker_, spin.deadline());
   }
   ucp_request_free(req);
   TORCH_CHECK(st == UCS_OK, "commux request failed: ", ucs_status_string(st));
@@ -690,43 +751,51 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupUCX::recvAnysource(
       tensors, source_rank);
 }
 
-// -------------------------------------------------------------------------
-// Collectives (linear reduce-to-root + broadcast over tagged p2p).
-// Correctness-first; recursive-doubling is a future optimization. Typical
-// payloads (timestep / diagnostics) are tiny, so linear is fine.
-// -------------------------------------------------------------------------
+// Collectives: binomial tree over tagged p2p; 2*ceil(log2(P)) messages/rank.
 
 void ProcessGroupUCX::reduce_locked(std::vector<at::Tensor>& tensors,
                                     c10d::ReduceOp op, int root) {
+  TORCH_CHECK(root >= 0 && root < size_, "commux reduce: root out of range");
+  int vrank = (rank_ - root + size_) % size_;
   for (size_t i = 0; i < tensors.size(); ++i) {
     at::Tensor& t = tensors[i];
     TORCH_CHECK(t.is_contiguous(), "commux reduce: tensor must be contiguous");
-    if (rank_ == root) {
-      at::Tensor tmp = at::empty_like(t);
-      for (int r = 0; r < size_; ++r) {
-        if (r == root) continue;
-        coll_recv(tmp, r, static_cast<uint32_t>(i));
-        apply_reduce(t, tmp, op);
+    at::Tensor acc = t, tmp;
+    for (int mask = 1; mask < size_; mask <<= 1) {
+      if (vrank & mask) {
+        coll_send(acc, (vrank - mask + root) % size_, static_cast<uint32_t>(i));
+        break;
       }
-    } else {
-      coll_send(t, root, static_cast<uint32_t>(i));
+      if (vrank + mask < size_) {
+        if (!tmp.defined()) {
+          tmp = at::empty_like(t);
+          if (vrank != 0) acc = t.clone();
+        }
+        coll_recv(tmp, (vrank + mask + root) % size_, static_cast<uint32_t>(i));
+        apply_reduce(acc, tmp, op);
+      }
     }
   }
 }
 
 void ProcessGroupUCX::broadcast_locked(std::vector<at::Tensor>& tensors,
                                        int root) {
+  TORCH_CHECK(root >= 0 && root < size_, "commux broadcast: root out of range");
+  int vrank = (rank_ - root + size_) % size_;
   for (size_t i = 0; i < tensors.size(); ++i) {
     at::Tensor& t = tensors[i];
     TORCH_CHECK(t.is_contiguous(),
                 "commux broadcast: tensor must be contiguous");
-    if (rank_ == root) {
-      for (int r = 0; r < size_; ++r) {
-        if (r == root) continue;
-        coll_send(t, r, static_cast<uint32_t>(i));
+    int mask = 1;
+    for (; mask < size_; mask <<= 1) {
+      if (vrank & mask) {
+        coll_recv(t, (vrank - mask + root) % size_, static_cast<uint32_t>(i));
+        break;
       }
-    } else {
-      coll_recv(t, root, static_cast<uint32_t>(i));
+    }
+    for (mask >>= 1; mask > 0; mask >>= 1) {
+      if (vrank + mask < size_)
+        coll_send(t, (vrank + mask + root) % size_, static_cast<uint32_t>(i));
     }
   }
 }
