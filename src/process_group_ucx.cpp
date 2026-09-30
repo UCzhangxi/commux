@@ -280,6 +280,21 @@ void apply_reduce(at::Tensor& acc, const at::Tensor& other, c10d::ReduceOp op) {
   }
 }
 
+// Every rank checks the op before a reduce sends anything: apply_reduce runs
+// only on the ranks that receive, after the others have sent and returned.
+void check_reduce_op(c10d::ReduceOp op, const char* what) {
+  switch (op.op_) {
+    case c10d::ReduceOp::SUM:
+    case c10d::ReduceOp::PRODUCT:
+    case c10d::ReduceOp::MIN:
+    case c10d::ReduceOp::MAX:
+      return;
+    default:
+      TORCH_CHECK(false, "commux ", what, ": unsupported ReduceOp ",
+                  static_cast<int>(op.op_));
+  }
+}
+
 // c10d::Work wrapping a set of in-flight ucp requests. wait()/isCompleted()
 // drive the shared worker's progress engine (the classic "wait_req" loop). The
 // worker is UCS_THREAD_MODE_MULTI (internally thread-safe), so waiting on one
@@ -802,6 +817,7 @@ void ProcessGroupUCX::broadcast_locked(std::vector<at::Tensor>& tensors,
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupUCX::allreduce(
     std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
+  check_reduce_op(opts.reduceOp, "allreduce");
   std::lock_guard<std::mutex> lock(worker_mu_);
   if (size_ > 1) {
     reduce_locked(tensors, opts.reduceOp, /*root=*/0);
@@ -812,6 +828,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupUCX::allreduce(
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupUCX::reduce(
     std::vector<at::Tensor>& tensors, const c10d::ReduceOptions& opts) {
+  check_reduce_op(opts.reduceOp, "reduce");
   std::lock_guard<std::mutex> lock(worker_mu_);
   if (size_ > 1) {
     reduce_locked(tensors, opts.reduceOp, static_cast<int>(opts.rootRank));
